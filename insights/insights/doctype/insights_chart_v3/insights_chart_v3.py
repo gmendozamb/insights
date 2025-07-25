@@ -68,7 +68,7 @@ class InsightsChartv3(Document):
                 "workbook": self.workbook,
                 "query": self.query,
                 "chart_type": self.chart_type,
-                "config": self.config,
+                "config": frappe.parse_json(self.config),
             },
             "dependencies": {
                 "queries": {},
@@ -90,7 +90,7 @@ def import_chart(chart, workbook):
     new_chart.workbook = workbook
     new_chart.insert()
 
-    if workbook == chart.doc.workbook or not chart.dependencies.queries:
+    if str(workbook) == str(chart.doc.workbook) or not chart.dependencies.queries:
         return new_chart.name
 
     for _, exported_query in chart.dependencies.queries.items():

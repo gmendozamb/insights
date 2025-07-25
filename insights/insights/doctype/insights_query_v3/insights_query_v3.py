@@ -25,6 +25,7 @@ class InsightsQueryv3(Document):
 
     if TYPE_CHECKING:
         from frappe.types import DF
+        from insights.insights.doctype.insights_query_variable.insights_query_variable import InsightsQueryVariable
 
         is_builder_query: DF.Check
         is_native_query: DF.Check
@@ -34,6 +35,7 @@ class InsightsQueryv3(Document):
         operations: DF.JSON | None
         title: DF.Data | None
         use_live_connection: DF.Check
+        variables: DF.Table[InsightsQueryVariable]
         workbook: DF.Link
     # end: auto-generated types
 
@@ -193,7 +195,7 @@ class InsightsQueryv3(Document):
                 "is_script_query": self.is_script_query,
                 "is_builder_query": self.is_builder_query,
                 "is_native_query": self.is_native_query,
-                "operations": self.operations,
+                "operations": frappe.parse_json(self.operations),
             },
             "dependencies": {
                 "queries": {},
@@ -217,7 +219,7 @@ def import_query(query, workbook):
     new_query.workbook = workbook
     new_query.insert()
 
-    if workbook == query.doc.workbook or not query.dependencies.queries:
+    if str(workbook) == str(query.doc.workbook) or not query.dependencies.queries:
         return new_query.name
 
     # if query is copied to a new workbook, all the dependencies will be copied as well

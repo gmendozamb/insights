@@ -177,10 +177,11 @@ class IbisQueryBuilder:
                     "t2": right_table,
                 },
             )
-            right_table_columns = self.get_columns_from_expression(
-                expression, table=join_args.table.table_name
-            )
-            select_columns.update(right_table_columns)
+            columns_from_exp = self.get_columns_from_expression(expression)
+            if columns_from_exp:
+                # filter columns to only include those that exist in right_table
+                columns_from_exp = [col for col in columns_from_exp if col in right_table.columns]
+                select_columns.update(columns_from_exp)
 
         return right_table.select(select_columns)
 
@@ -304,10 +305,28 @@ class IbisQueryBuilder:
         if filter_operator in ["contains", "not_contains"]:
             filter_value = filter_value.replace("%", "")
 
+        if filter_operator == "between":
+            start = filter_value[0]
+            end = filter_value[1]
+
+            if isinstance(start, str) and isinstance(end, str):
+                contains_time = ":" in start or ":" in end
+                if not contains_time:
+                    start = f"{start} 00:00:00"
+                    end = f"{end} 23:59:59"
+
+            filter_value = [start, end]
+
         right_value = right_column or filter_value
         return operator_fn(left, right_value)
 
     def get_operator(self, operator):
+        def null_check(is_null, x):
+            rt = x.isnull() if is_null else x.notnull()
+            if x.type().is_string():
+                rt = rt & (x != "")
+            return rt
+
         return {
             ">": lambda x, y: x > y,
             "<": lambda x, y: x < y,
@@ -317,8 +336,8 @@ class IbisQueryBuilder:
             "<=": lambda x, y: x <= y,
             "in": lambda x, y: x.isin(y),
             "not_in": lambda x, y: ~x.isin(y),
-            "is_set": lambda x, y: (x.notnull()) & (x != ""),
-            "is_not_set": lambda x, y: (x.isnull()) | (x == ""),
+            "is_set": lambda x, y: null_check(False, x),
+            "is_not_set": lambda x, y: null_check(True, x),
             "contains": lambda x, y: x.like(f"%{y}%"),
             "not_contains": lambda x, y: ~x.like(f"%{y}%"),
             "starts_with": lambda x, y: x.like(f"{y}%"),
@@ -473,7 +492,10 @@ class IbisQueryBuilder:
         if cached_results is not None:
             results = cached_results
         else:
-            results = get_code_results(code)
+            variables = None
+            if hasattr(self.doc, "variables") and self.doc.variables:
+                variables = self.doc.variables
+            results = get_code_results(code, variables=variables)
             cache_results(digest, results, cache_expiry=60 * 10)
 
         return Warehouse().db.create_table(
@@ -725,7 +747,7 @@ class SafePandasDataFrame(pd.DataFrame):
         raise NotImplementedError("to_json is not supported in this context")
 
 
-def get_code_results(code: str):
+def get_code_results(code: str, variables=None):
     pandas = frappe._dict()
     pandas.DataFrame = SafePandasDataFrame
     pandas.read_csv = pd.read_csv
@@ -733,10 +755,24 @@ def get_code_results(code: str):
 
     results = []
     frappe.debug_log = []
+
+    variable_context = {}
+    if variables:
+        from frappe.utils.password import get_decrypted_password
+
+        for var in variables:
+            if hasattr(var, "variable_name") and hasattr(var, "variable_value"):
+                variable_context[var.variable_name] = get_decrypted_password(
+                    var.doctype, var.name, "variable_value"
+                )
+            elif isinstance(var, dict):
+                variable_context[var.get("variable_name")] = var.get("variable_value")
+
+    _locals = {"results": results, **variable_context}
     _, _locals = safe_exec(
         code,
         _globals={"pandas": pandas},
-        _locals={"results": results},
+        _locals=_locals,
         restrict_commit_rollback=True,
     )
     results = _locals["results"]

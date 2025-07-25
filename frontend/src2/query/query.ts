@@ -1,5 +1,6 @@
 import { useDebouncedRefHistory } from '@vueuse/core'
 import { isEqual } from 'es-toolkit'
+import { dayjs } from 'frappe-ui'
 import { computed, reactive, ref, toRefs, unref } from 'vue'
 import {
 	copy,
@@ -21,9 +22,12 @@ import {
 	ColumnDataType,
 	ColumnOption,
 	CustomOperationArgs,
+	Dimension,
+	FilterArgs,
 	FilterGroupArgs,
 	FilterRule,
 	JoinArgs,
+	Measure,
 	MutateArgs,
 	Operation,
 	OrderByArgs,
@@ -39,13 +43,14 @@ import {
 	SummarizeArgs,
 	UnionArgs,
 } from '../types/query.types'
-import { InsightsQueryv3 } from '../types/workbook.types'
+import { InsightsQueryv3, QueryVariable } from '../types/workbook.types'
 import useWorkbook from '../workbook/workbook'
 import {
 	cast,
 	code,
 	column,
 	custom_operation,
+	expression,
 	filter_group,
 	getDimensions,
 	getFormattedRows,
@@ -546,6 +551,28 @@ export function makeQuery(name: string) {
 		}
 	}
 
+	function updateVariables(variables: QueryVariable[]) {
+		if (!query.doc.is_script_query) return Promise.resolve()
+
+		query.doc.variables = variables
+		return query.save()
+			.then(() => {
+				createToast({
+					title: 'Variables Updated',
+					message: 'Script variables have been saved securely.',
+					variant: 'success',
+				})
+			})
+			.catch((error) => {
+				createToast({
+					title: 'Failed to Update Variables',
+					message: error.message || 'An error occurred while saving variables.',
+					variant: 'error',
+				})
+				throw error
+			})
+	}
+
 	function getDrillDownQuery(col: QueryResultColumn, row: QueryResultRow) {
 		if (!session.isLoggedIn) {
 			return
@@ -563,59 +590,31 @@ export function makeQuery(name: string) {
 
 		const operations = copy(query.doc.operations)
 		const reversedOperations = operations.slice().reverse()
-		const lastSummarizeIdx = reversedOperations.findIndex((op) => op.type === 'summarize')
-		if (lastSummarizeIdx === -1) {
-			console.error('No summarize operation found')
-			return
-		}
-
-		const actualSummarizeIdx = reversedOperations.length - lastSummarizeIdx - 1
-		const summarizeOperation = operations[actualSummarizeIdx] as Summarize
-
-		const groupByColumns = summarizeOperation.dimensions
-		const rowIndex = result.value.formattedRows.findIndex((r) => r === row)
-		const currRow = result.value.rows[rowIndex]
-		const nextRow = result.value.rows[rowIndex + 1]
-
-		const filters: FilterRule[] = []
-		for (const c of groupByColumns) {
-			if (FIELDTYPES.TEXT.includes(c.data_type)) {
-				filters.push({
-					column: column(c.column_name),
-					operator: '=',
-					value: currRow[c.dimension_name] as string,
-				})
-			}
-
-			if (FIELDTYPES.DATE.includes(c.data_type)) {
-				if (nextRow) {
-					filters.push({
-						column: column(c.column_name),
-						operator: '>=',
-						value: currRow[c.dimension_name] as string,
-					})
-					filters.push({
-						column: column(c.column_name),
-						operator: '<',
-						value: nextRow[c.dimension_name] as string,
-					})
-				} else {
-					filters.push({
-						column: column(c.column_name),
-						operator: '>=',
-						value: currRow[c.dimension_name] as string,
-					})
-				}
-			}
-		}
 
 		const drill_down_query = useQuery('new-query-' + getUniqueId())
 		drill_down_query.doc.title = 'Drill Down'
 		drill_down_query.autoExecute = true
 		drill_down_query.doc.workbook = query.doc.workbook
 		drill_down_query.doc.use_live_connection = query.doc.use_live_connection
-		drill_down_query.setOperations(operations.slice(0, actualSummarizeIdx))
 
+		let filters: FilterArgs[] = []
+		let sliceIdx = -1
+		const rowIndex = result.value.formattedRows.findIndex((r) => r === row)
+		const currRow = result.value.rows[rowIndex]
+
+		const lastPivotIdx = reversedOperations.findIndex((op: Operation) => op.type === 'pivot_wider')
+		if (lastPivotIdx !== -1) {
+			sliceIdx = reversedOperations.length - lastPivotIdx - 1
+			filters = getDrillDownQueryForPivot(operations, sliceIdx, col, currRow)
+		}
+
+		const lastSummarizeIdx = reversedOperations.findIndex((op: Operation) => op.type === 'summarize')
+		if (lastSummarizeIdx !== -1) {
+			sliceIdx = reversedOperations.length - lastSummarizeIdx - 1
+			filters = getDrillDownQueryForSummarize(operations, sliceIdx, col, currRow)
+		}
+
+		drill_down_query.setOperations(operations.slice(0, sliceIdx))
 		drill_down_query.addFilterGroup({
 			logical_operator: 'And',
 			filters: filters,
@@ -624,8 +623,133 @@ export function makeQuery(name: string) {
 		return drill_down_query
 	}
 
+
+	function getFiltersForDimension(dim: Dimension, value: string) {
+		const filters: FilterRule[] = []
+
+		if (!FIELDTYPES.DATE.includes(dim.data_type)) {
+			filters.push({
+				column: column(dim.column_name),
+				operator: '=',
+				value: value,
+			})
+		}
+
+		if (FIELDTYPES.DATE.includes(dim.data_type)) {
+			const start = dayjs(value);
+
+			filters.push({
+				column: column(dim.column_name),
+				operator: '>=',
+				value: start.format('YYYY-MM-DD HH:mm:ss'),
+			});
+
+			if (dim.granularity) {
+				const end = start.clone().add(1, dim.granularity);
+				filters.push({
+					column: column(dim.column_name),
+					operator: '<',
+					value: end.format('YYYY-MM-DD HH:mm:ss'),
+				});
+			}
+		}
+
+		return filters
+	}
+
+	function getFiltersForMeasure(measure: Measure, columnName: string) {
+		if (measure.measure_name !== columnName || 'expression' in measure === false || !measure.expression) {
+			return []
+		}
+
+		// patterns to match to extract the condition
+		// 1. count_if(order_status == 'delivered')
+		// 2. count_if(order_status == 'delivered', order_id)
+		// 3. sum_if(order_status == 'delivered', order_id)
+		// 4. distinct_count_if(order_status == 'delivered', order_id)
+		const exp = measure.expression.expression
+		const patterns = [
+			/^count_if\(([^,]+),\s*([^)]+)\)$/,
+			/^count_if\(([^,]+)\)$/,
+			/^sum_if\(([^,]+),\s*([^)]+)\)$/,
+			/^distinct_count_if\(([^,]+),\s*([^)]+)\)$/,
+		]
+		const pattern = patterns.find((p) => exp.match(p))
+		if (pattern) {
+			const match = exp.match(pattern)
+			if (match) {
+				const condition = match[1].trim()
+				return [{
+					expression: expression(condition),
+				}]
+			}
+		}
+
+		return []
+	}
+
+	function getDrillDownQueryForSummarize(
+		operations: Operation[],
+		summarizeIdx: number,
+		col: QueryResultColumn,
+		row: QueryResultRow
+	) {
+
+		const filters: FilterArgs[] = []
+		const summarizeOperation = operations[summarizeIdx] as Summarize
+		summarizeOperation.dimensions.forEach((c) => {
+			filters.push(...getFiltersForDimension(c, row[c.dimension_name]))
+		})
+
+		summarizeOperation.measures.forEach((m) => {
+			filters.push(...getFiltersForMeasure(m, col.name))
+		})
+
+		return filters
+	}
+
+	function getDrillDownQueryForPivot(
+		operations: Operation[],
+		pivotIdx: number,
+		col: QueryResultColumn,
+		row: QueryResultRow
+	) {
+		const drill_down_query = useQuery('new-query-' + getUniqueId())
+		drill_down_query.doc.title = 'Drill Down'
+		drill_down_query.autoExecute = true
+		drill_down_query.doc.workbook = query.doc.workbook
+		drill_down_query.doc.use_live_connection = query.doc.use_live_connection
+		drill_down_query.setOperations(operations.slice(0, pivotIdx))
+
+		const pivotOperation = operations[pivotIdx] as PivotWiderArgs
+
+		const filters: FilterArgs[] = []
+		pivotOperation.rows.forEach((c) => {
+			filters.push(...getFiltersForDimension(c, row[c.dimension_name]))
+		})
+
+		const pivotColumnValues = col.name.split('___').reverse()
+		// each value in the pivot column values corresponds to a column in the pivot operation "columns"
+		// for eg. if the pivot column values are ["A", "B", "C"], then these values correspond to
+		// pivotOperation.columns[0], pivotOperation.columns[1], pivotOperation.columns[2]
+		pivotOperation.columns.forEach((c, idx) => {
+			if (pivotColumnValues[idx]) {
+				filters.push(...getFiltersForDimension(c, pivotColumnValues[idx]))
+			}
+		})
+
+		// if there are more than one value then there are two headers in the pivot table
+		// the last one displays the measure name, so we get the current measure name from pivotColumnValues
+		const selectedValueColumn = pivotOperation.values.length == 1 ? pivotOperation.values[0].measure_name : pivotColumnValues.at(-1) as string
+		pivotOperation.values.forEach((m) => {
+			return filters.push(...getFiltersForMeasure(m, selectedValueColumn))
+		})
+
+		return filters
+	}
+
 	function validateDrillDown(col: QueryResultColumn, row: QueryResultRow) {
-		if (!query.doc.operations.find((op) => op.type === 'summarize')) {
+		if (!query.doc.operations.find((op) => op.type === 'summarize' || op.type === 'pivot_wider')) {
 			return 'Drill down is only supported on summarized data'
 		}
 
@@ -745,6 +869,7 @@ export function makeQuery(name: string) {
 
 		getCodeOperation,
 		setCode,
+		updateVariables,
 
 		dimensions,
 		measures,
