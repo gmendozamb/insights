@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useWindowSize } from '@vueuse/core'
+import { useStorage, useWindowSize } from '@vueuse/core'
 import { Edit3, RefreshCcw, Share2 } from 'lucide-vue-next'
 import { computed, provide, ref, watchEffect } from 'vue'
 import ContentEditable from '../components/ContentEditable.vue'
@@ -54,6 +54,8 @@ function onDrop(event: DragEvent) {
 }
 
 const showShareDialog = ref(false)
+
+const verticalCompact = useStorage('dashboard_vertical_compact', true)
 </script>
 
 <template>
@@ -124,10 +126,41 @@ const showShareDialog = ref(false)
 						v-if="dashboard.editing"
 						variant="solid"
 						icon-left="check"
-						@click="dashboard.editing = false"
+						@click="
+							() => {
+								dashboard.save()
+								dashboard.editing = false
+							}
+						"
 					>
 						Done
 					</Button>
+					<Dropdown
+						:button="{ icon: 'more-horizontal', variant: 'outline' }"
+						:options="[
+							{
+								label: 'Force Refresh',
+								icon: RefreshCcw,
+								onClick: () => dashboard.refresh(true),
+							},
+							dashboard.editing
+								? {
+										label: 'Compact Layout',
+										icon: verticalCompact ? 'check-square' : 'square',
+										onClick: () => (verticalCompact = !verticalCompact),
+								  }
+								: null,
+							dashboard.editing
+								? {
+										label: 'Reset Layout',
+										icon: 'refresh-ccw',
+										onClick: () => (
+											dashboard.discard(), (dashboard.editing = false)
+										),
+								  }
+								: null,
+						]"
+					/>
 				</div>
 			</div>
 			<div class="flex-1 overflow-y-auto p-2 pt-0" @dragover="onDragOver" @drop="onDrop">
@@ -137,12 +170,15 @@ const showShareDialog = ref(false)
 					:class="[dashboard.editing ? 'mb-[20rem] !select-none' : '']"
 					:cols="20"
 					:disabled="!dashboard.editing"
+					:verticalCompact="verticalCompact"
 					:modelValue="dashboard.doc.items.map((item) => item.layout)"
 					@update:modelValue="
 						(newLayout) => {
+							if (!newLayout) return
 							dashboard.doc.items.forEach((item, idx) => {
 								item.layout = newLayout[idx]
 							})
+							dashboard.normalizeLayout()
 						}
 					"
 				>

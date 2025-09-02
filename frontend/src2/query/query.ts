@@ -28,6 +28,7 @@ import {
 	FilterRule,
 	JoinArgs,
 	Measure,
+	Mutate,
 	MutateArgs,
 	Operation,
 	OrderByArgs,
@@ -366,6 +367,21 @@ export function makeQuery(name: string) {
 	}
 
 	function renameColumn(oldName: string, newName: string) {
+		// Check if there's a mutate operation with the old name
+		const existingMutateIdx = currentOperations.value.findIndex(
+			(op) => op.type === 'mutate' && op.new_name === oldName
+		)
+
+		if (existingMutateIdx !== -1) {
+			// Update the new_name property of the existing mutate operation
+			const mutateOp = query.doc.operations[existingMutateIdx] as Mutate
+			query.doc.operations[existingMutateIdx] = {
+				...mutateOp,
+				new_name: newName
+			}
+			return
+		}
+
 		const existingRenameIdx = currentOperations.value.findIndex(
 			(op) => op.type === 'rename' && op.new_name === oldName
 		)
@@ -417,6 +433,21 @@ export function makeQuery(name: string) {
 	}
 
 	function changeColumnType(column_name: string, newType: ColumnDataType) {
+		// Check if there's a mutate operation with the old name
+		const existingMutateIdx = currentOperations.value.findIndex(
+			(op) => op.type === 'mutate' && op.new_name === column_name
+		)
+
+		if (existingMutateIdx !== -1) {
+			// Update the new_name property of the existing mutate operation
+			const mutateOp = query.doc.operations[existingMutateIdx] as Mutate
+			query.doc.operations[existingMutateIdx] = {
+				...mutateOp,
+				data_type: newType
+			}
+			return
+		}
+
 		addOperation(
 			cast({
 				column: column(column_name),
@@ -530,12 +561,12 @@ export function makeQuery(name: string) {
 		return query.doc.operations.find((op) => op.type === 'sql')
 	}
 
-	function setSQL(args: SQLArgs) {
+	function setSQL(args: SQLArgs, force: boolean = false) {
 		query.doc.operations = []
 		if (args.raw_sql.trim().length) {
 			query.doc.operations.push(sql(args))
 			activeOperationIdx.value = 0
-			execute()
+			execute(force)
 		} else {
 			activeOperationIdx.value = -1
 		}
@@ -597,7 +628,6 @@ export function makeQuery(name: string) {
 
 		const drill_down_query = useQuery('new-query-' + getUniqueId())
 		drill_down_query.doc.title = 'Drill Down'
-		drill_down_query.doc.workbook = query.doc.workbook
 		drill_down_query.doc.use_live_connection = query.doc.use_live_connection
 		drill_down_query.autoExecute = true
 
